@@ -14,3 +14,4 @@ ciborium = "0.2"
 libc = "0.2"
 # Wir nutzen nix 0.29 (passend zu Edition 2024)
 nix = { version = "0.29", features = ["socket", "fs", "process", "uio"] }
+cbindgen = "0.26"
