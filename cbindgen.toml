@@ -1,0 +1,13 @@
+language = "C"
+include_guard = "LXPC_H"
+style = "type"
+
+[parse]
+parse_deps = true
+include = ["lxpc"]
+
+[fn]
+rename_args = "snake_case"
+
+[export]
+item_types = ["functions", "opaque", "typedefs"]

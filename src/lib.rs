@@ -1,230 +1,344 @@
-use std::collections::HashMap;
+mod lxpc;
+
+
 use std::ffi::{CStr, CString};
-use std::os::unix::io::{FromRawFd, RawFd, BorrowedFd}; 
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::io::RawFd;
 use std::ptr;
-use std::thread;
-use std::io::{Read, IoSlice, IoSliceMut}; 
-use std::sync::{Arc, Mutex};
-use serde::{Serialize, Deserialize};
 
-#[cfg(target_os = "linux")]
-use nix::sys::socket::sockopt::PeerCredentials;
-use nix::sys::socket::{
-    getsockopt, sendmsg, recvmsg, ControlMessage, ControlMessageOwned, MsgFlags
-};
-
-// --- Konstanten & Definitionen ---
-pub const LXPC_TYPE_ERROR: i32 = 0;
-pub const LXPC_TYPE_DICTIONARY: i32 = 1;
-const LXPC_MAGIC: u32 = 0x4C585043; 
+use crate::lxpc::{LxpcConnection, LxpcObject};
 
 #[allow(non_camel_case_types)]
-#[repr(C)]
-pub struct lxpc_connection {
-    fd: RawFd,
-    handler: Arc<Mutex<Option<extern "C" fn(*mut lxpc_object)>>>,
-    running: Arc<Mutex<bool>>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub enum LxpcValue {
-    String(String),
-    Int64(i64),
-    Bool(bool),
-    Dictionary(HashMap<String, LxpcValue>), 
-    Fd(RawFd), 
-}
-
+pub type lxpc_object     = LxpcObject;
 #[allow(non_camel_case_types)]
-#[derive(Serialize, Deserialize, Clone)]
-#[repr(C)]
-pub struct lxpc_object {
-    pub obj_type: i32,
-    pub data: HashMap<String, LxpcValue>, 
-}
+pub type lxpc_connection = LxpcConnection;
 
-// --- Speicherverwaltung ---
+// ---------------------------------------------------------------------------
+// Speicherverwaltung
+// ---------------------------------------------------------------------------
 
-#[unsafe(no_mangle)]
+/// Gibt ein LxpcObject frei das von LXPC auf dem Heap alloziert wurde.
+///
+/// MUSS nach jedem Aufruf eines Message-Handlers genau einmal aufgerufen werden.
+/// Doppelter Aufruf ist undefined behavior.
+#[no_mangle]
 pub unsafe extern "C" fn lxpc_object_release(ptr: *mut lxpc_object) {
     if !ptr.is_null() {
-        let _ = unsafe { Box::from_raw(ptr) };
+        drop(Box::from_raw(ptr));
     }
 }
 
-#[unsafe(no_mangle)]
+/// Gibt einen String frei der von lxpc_dictionary_get_string zurückgegeben wurde.
+///
+/// MUSS für jeden von LXPC zurückgegebenen String genau einmal aufgerufen werden.
+#[no_mangle]
 pub unsafe extern "C" fn lxpc_string_release(ptr: *mut libc::c_char) {
     if !ptr.is_null() {
-        let _ = unsafe { CString::from_raw(ptr) };
+        drop(CString::from_raw(ptr));
     }
 }
 
-// --- Dictionary API ---
-
-#[unsafe(no_mangle)]
-pub extern "C" fn lxpc_dictionary_create() -> *mut lxpc_object {
-    Box::into_raw(Box::new(lxpc_object {
-        obj_type: LXPC_TYPE_DICTIONARY,
-        data: HashMap::new(),
-    }))
+/// Gibt eine LxpcConnection frei.
+///
+/// Sollte erst aufgerufen werden wenn der Lese-Thread nicht mehr läuft.
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_connection_release(ptr: *mut lxpc_connection) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr));
+    }
 }
 
-#[unsafe(no_mangle)]
+// ---------------------------------------------------------------------------
+// Dictionary API
+// ---------------------------------------------------------------------------
+
+/// Erzeugt ein neues, leeres Dictionary. Gibt NULL zurück wenn die Allokation scheitert.
+/// Muss mit lxpc_object_release() freigegeben werden.
+#[no_mangle]
+pub extern "C" fn lxpc_dictionary_create() -> *mut lxpc_object {
+    Box::into_raw(Box::new(LxpcObject::new_dictionary()))
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn lxpc_dictionary_set_string(
     obj: *mut lxpc_object,
     key: *const libc::c_char,
     value: *const libc::c_char,
 ) {
-    if obj.is_null() || key.is_null() || value.is_null() { return; }
-    let dict = unsafe { &mut *obj };
-    let k = unsafe { CStr::from_ptr(key) }.to_string_lossy().into_owned();
-    let v = unsafe { CStr::from_ptr(value) }.to_string_lossy().into_owned();
-    dict.data.insert(k, LxpcValue::String(v));
+    let (Some(dict), false, false) = (obj.as_mut(), key.is_null(), value.is_null()) else { return };
+    let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+    let v = CStr::from_ptr(value).to_string_lossy().into_owned();
+    dict.set_string(k, v);
 }
 
-#[unsafe(no_mangle)]
+/// Gibt den Wert als neu allozierter C-String zurück.
+/// MUSS mit lxpc_string_release() freigegeben werden.
+/// Gibt NULL zurück wenn der Key nicht existiert oder kein String ist.
+#[no_mangle]
 pub unsafe extern "C" fn lxpc_dictionary_get_string(
-    obj: *mut lxpc_object,
+    obj: *const lxpc_object,
     key: *const libc::c_char,
 ) -> *mut libc::c_char {
-    if obj.is_null() || key.is_null() { return ptr::null_mut(); }
-    let dict = unsafe { &*obj };
-    let k = unsafe { CStr::from_ptr(key) }.to_string_lossy();
-    if let Some(LxpcValue::String(val)) = dict.data.get(k.as_ref()) {
-        return CString::new(val.as_str()).unwrap().into_raw();
+    let (Some(dict), false) = (obj.as_ref(), key.is_null()) else { return ptr::null_mut() };
+    let k = CStr::from_ptr(key).to_string_lossy();
+    match dict.get_string(&k) {
+        Some(s) => CString::new(s).map(CString::into_raw).unwrap_or(ptr::null_mut()),
+        None    => ptr::null_mut(),
     }
-    ptr::null_mut()
 }
 
-// --- Netzwerk & Framing ---
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_dictionary_set_int64(
+    obj: *mut lxpc_object,
+    key: *const libc::c_char,
+    value: i64,
+) {
+    let (Some(dict), false) = (obj.as_mut(), key.is_null()) else { return };
+    let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+    dict.set_int64(k, value);
+}
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lxpc_connection_send_message(conn: *mut lxpc_connection, obj: *mut lxpc_object) {
-    if conn.is_null() || obj.is_null() { return; }
-    let conn = unsafe { &mut *conn };
-    let dict = unsafe { &*obj };
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_dictionary_get_int64(
+    obj: *const lxpc_object,
+    key: *const libc::c_char,
+    out: *mut i64,
+) -> bool {
+    let (Some(dict), false, false) = (obj.as_ref(), key.is_null(), out.is_null()) else { return false };
+    let k = CStr::from_ptr(key).to_string_lossy();
+    match dict.get_int64(&k) {
+        Some(v) => { *out = v; true }
+        None    => false,
+    }
+}
 
-    let mut fds_to_beam = Vec::new();
-    for val in dict.data.values() {
-        if let LxpcValue::Fd(fd) = val {
-            fds_to_beam.push(*fd);
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_dictionary_set_double(
+    obj: *mut lxpc_object,
+    key: *const libc::c_char,
+    value: f64,
+) {
+    let (Some(dict), false) = (obj.as_mut(), key.is_null()) else { return };
+    let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+    dict.set_double(k, value);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_dictionary_get_double(
+    obj: *const lxpc_object,
+    key: *const libc::c_char,
+    out: *mut f64,
+) -> bool {
+    let (Some(dict), false, false) = (obj.as_ref(), key.is_null(), out.is_null()) else { return false };
+    let k = CStr::from_ptr(key).to_string_lossy();
+    match dict.get_double(&k) {
+        Some(v) => { *out = v; true }
+        None    => false,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_dictionary_set_bool(
+    obj: *mut lxpc_object,
+    key: *const libc::c_char,
+    value: bool,
+) {
+    let (Some(dict), false) = (obj.as_mut(), key.is_null()) else { return };
+    let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+    dict.set_bool(k, value);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_dictionary_get_bool(
+    obj: *const lxpc_object,
+    key: *const libc::c_char,
+    out: *mut bool,
+) -> bool {
+    let (Some(dict), false, false) = (obj.as_ref(), key.is_null(), out.is_null()) else { return false };
+    let k = CStr::from_ptr(key).to_string_lossy();
+    match dict.get_bool(&k) {
+        Some(v) => { *out = v; true }
+        None    => false,
+    }
+}
+
+/// Setzt einen rohen Byte-Blob. Die Daten werden kopiert.
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_dictionary_set_data(
+    obj: *mut lxpc_object,
+    key: *const libc::c_char,
+    data: *const u8,
+    len: libc::size_t,
+) {
+    let (Some(dict), false, false) = (obj.as_mut(), key.is_null(), data.is_null()) else { return };
+    let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+    let bytes = std::slice::from_raw_parts(data, len).to_vec();
+    dict.set_data(k, bytes);
+}
+
+/// Setzt eine UUID (genau 16 Bytes). Gibt false zurück wenn uuid_ptr NULL ist.
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_dictionary_set_uuid(
+    obj: *mut lxpc_object,
+    key: *const libc::c_char,
+    uuid_ptr: *const u8, // Muss auf genau 16 Bytes zeigen
+) -> bool {
+    let (Some(dict), false, false) = (obj.as_mut(), key.is_null(), uuid_ptr.is_null()) else { return false };
+    let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+    let bytes: [u8; 16] = std::slice::from_raw_parts(uuid_ptr, 16).try_into().unwrap();
+    dict.set_uuid(k, bytes);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_dictionary_set_null(
+    obj: *mut lxpc_object,
+    key: *const libc::c_char,
+) {
+    let (Some(dict), false) = (obj.as_mut(), key.is_null()) else { return };
+    let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+    dict.set_null(k);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_dictionary_set_fd(
+    obj: *mut lxpc_object,
+    key: *const libc::c_char,
+    fd: RawFd,
+) {
+    let (Some(dict), false) = (obj.as_mut(), key.is_null()) else { return };
+    let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+    dict.set_fd(k, fd);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_dictionary_get_fd(
+    obj: *const lxpc_object,
+    key: *const libc::c_char,
+) -> RawFd {
+    let (Some(dict), false) = (obj.as_ref(), key.is_null()) else { return -1 };
+    let k = CStr::from_ptr(key).to_string_lossy();
+    dict.get_fd(&k).unwrap_or(-1)
+}
+
+/// Gibt die Message-ID zurück die LXPC automatisch gesetzt hat.
+/// Nützlich um Antworten zuzuordnen.
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_object_get_msg_id(obj: *const lxpc_object) -> i64 {
+    obj.as_ref()
+        .and_then(|o| o.get_int64("lxpc.msg_id"))
+        .unwrap_or(-1)
+}
+
+/// Gibt die Reply-To-ID zurück (oder -1 wenn das kein Reply ist).
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_object_get_reply_to(obj: *const lxpc_object) -> i64 {
+    obj.as_ref()
+        .and_then(|o| o.get_int64("lxpc.reply_to"))
+        .unwrap_or(-1)
+}
+
+// ---------------------------------------------------------------------------
+// Verbindungs-API
+// ---------------------------------------------------------------------------
+
+/// Verbindet sich mit einem benannten Dienst via syscored.
+/// Gibt NULL zurück wenn die Verbindung fehlschlägt.
+/// Muss mit lxpc_connection_release() freigegeben werden.
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_connection_create(name: *const libc::c_char) -> *mut lxpc_connection {
+    if name.is_null() { return ptr::null_mut(); }
+    let name_str = CStr::from_ptr(name).to_string_lossy();
+    match crate::lxpc::connect_to_service(&name_str) {
+        Ok(fd)  => Box::into_raw(Box::new(LxpcConnection::new(fd))),
+        Err(e)  => {
+            eprintln!("[lxpc ERROR] lxpc_connection_create('{name_str}'): {e}");
+            ptr::null_mut()
         }
     }
+}
 
-    let mut payload = Vec::new();
-    if ciborium::into_writer(dict, &mut payload).is_ok() {
-        let mut header = Vec::with_capacity(8);
-        header.extend_from_slice(&LXPC_MAGIC.to_le_bytes());
-        header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        
-        let iov = [IoSlice::new(&header), IoSlice::new(&payload)];
-        
-        let cmsgs = if !fds_to_beam.is_empty() {
-            vec![ControlMessage::ScmRights(&fds_to_beam)]
-        } else {
-            vec![]
-        };
-
-        let _ = sendmsg::<()>(conn.fd, &iov, &cmsgs, MsgFlags::empty(), None);
+/// Sendet eine Nachricht. Gibt 0 bei Erfolg, -1 bei Fehler zurück.
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_connection_send_message(
+    conn: *mut lxpc_connection,
+    obj: *const lxpc_object,
+) -> libc::c_int {
+    let (Some(conn_ref), Some(obj_ref)) = (conn.as_ref(), obj.as_ref()) else { return -1 };
+    match conn_ref.send_message(obj_ref) {
+        Ok(())  => 0,
+        Err(e)  => { eprintln!("[lxpc ERROR] send_message: {e}"); -1 }
     }
 }
 
-#[unsafe(no_mangle)]
+/// Sendet eine Antwort auf eine empfangene Nachricht.
+/// `reply_to_msg_id` ist der Wert von lxpc_object_get_msg_id() der Anfrage.
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_connection_send_reply(
+    conn: *mut lxpc_connection,
+    reply: *mut lxpc_object,
+    reply_to_msg_id: i64,
+) -> libc::c_int {
+    let (Some(conn_ref), Some(obj_ref)) = (conn.as_ref(), reply.as_mut()) else { return -1 };
+    match conn_ref.send_reply(obj_ref, reply_to_msg_id) {
+        Ok(())  => 0,
+        Err(e)  => { eprintln!("[lxpc ERROR] send_reply: {e}"); -1 }
+    }
+}
+
+/// Startet den Lese-Thread. Muss vor dem Empfangen von Nachrichten aufgerufen werden.
+#[no_mangle]
 pub unsafe extern "C" fn lxpc_connection_resume(conn: *mut lxpc_connection) {
-    if conn.is_null() { return; }
-    let conn = unsafe { &mut *conn };
-    let mut running = conn.running.lock().unwrap();
-    if *running { return; }
-    *running = true;
-
-    let fd = conn.fd;
-    let handler_arc = Arc::clone(&conn.handler);
-    let running_arc = Arc::clone(&conn.running);
-
-    thread::spawn(move || {
-        while *running_arc.lock().unwrap() {
-            let mut header_buf = [0u8; 8];
-            let mut cmsg_space = nix::cmsg_space!([RawFd; 10]);
-            let mut iov = [IoSliceMut::new(&mut header_buf)];
-
-            match recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_space), MsgFlags::empty()) {
-                Ok(msg) if msg.bytes > 0 => {
-                    
-                    let mut received_fds = Vec::new();
-                    
-                    // FIX: Ok() anstelle von Some(), da msg.cmsgs() nun ein Result zurückgibt!
-                    if let Ok(cmsg_iter) = msg.cmsgs() {
-                        for cmsg in cmsg_iter {
-                            if let ControlMessageOwned::ScmRights(fds) = cmsg {
-                                received_fds.extend(fds);
-                            }
-                        }
-                    }
-
-                    let magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-                    let length = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
-                    
-                    if magic == LXPC_MAGIC {
-                        let mut payload = vec![0u8; length as usize];
-                        let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
-                        
-                        if stream.read_exact(&mut payload).is_ok() {
-                            if let Ok(obj_data) = ciborium::from_reader::<lxpc_object, _>(&payload[..]) {
-                                let obj_ptr = Box::into_raw(Box::new(obj_data));
-                                let h_lock = handler_arc.lock().unwrap();
-                                if let Some(h) = *h_lock { h(obj_ptr); }
-                            }
-                        }
-                        std::mem::forget(stream); 
-                    }
-                }
-                _ => break, 
-            }
-        }
-    });
-}
-
-// --- Bootstrap (Sicherheits-Check) ---
-
-#[unsafe(no_mangle)]
-pub extern "C" fn lxpc_bootstrap_connection_activate() -> i32 {
-    let fd_raw: RawFd = 3;
-    let fd = unsafe { BorrowedFd::borrow_raw(fd_raw) };
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(creds) = getsockopt(&fd, PeerCredentials) {
-            if creds.pid() != 1 { return -3; }
-            return 0;
-        }
-        return -1;
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        0 
+    if let Some(conn_ref) = conn.as_ref() {
+        conn_ref.activate();
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lxpc_main(handler: extern "C" fn(*mut lxpc_connection)) {
-    if lxpc_bootstrap_connection_activate() != 0 {
-        unsafe { libc::exit(1) };
+/// Setzt den Handler für eingehende Nachrichten.
+/// Der Handler wird aus einem Hintergrund-Thread aufgerufen.
+/// WICHTIG: Der Handler MUSS lxpc_object_release() auf dem übergebenen Pointer aufrufen.
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_connection_set_event_handler(
+    conn: *mut lxpc_connection,
+    handler: extern "C" fn(*mut lxpc_object),
+) {
+    if let Some(conn_ref) = conn.as_mut() {
+        *conn_ref.handler.lock().unwrap() = Some(handler);
     }
+}
 
-    let listener = unsafe { UnixListener::from_raw_fd(3) };
-    for stream in listener.incoming() {
-        if let Ok(s) = stream {
-            use std::os::unix::io::AsRawFd;
-            let client_fd = s.as_raw_fd();
-            std::mem::forget(s); 
-            let conn = Box::into_raw(Box::new(lxpc_connection {
-                fd: client_fd,
-                handler: Arc::new(Mutex::new(None)),
-                running: Arc::new(Mutex::new(false)),
-            }));
-            handler(conn);
-        }
+/// Setzt den Handler für Verbindungsfehler (Verbindung getrennt, Protokollfehler, …).
+/// code: Fehlercode (immer negativ), msg: lesbare Fehlerbeschreibung (UTF-8, NULL-terminiert).
+/// Der String msg ist nur für die Dauer des Handler-Aufrufs gültig — nicht speichern ohne zu kopieren!
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_connection_set_error_handler(
+    conn: *mut lxpc_connection,
+    handler: extern "C" fn(libc::c_int, *const libc::c_char),
+) {
+    if let Some(conn_ref) = conn.as_mut() {
+        *conn_ref.error_handler.lock().unwrap() = Some(handler);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap & Daemon-Main
+// ---------------------------------------------------------------------------
+
+/// Prüft ob der Prozess korrekt von syscored (PID 1) gestartet wurde.
+/// Gibt 0 zurück bei Erfolg, negativen Fehlercode bei Misserfolg.
+#[no_mangle]
+pub extern "C" fn lxpc_bootstrap_connection_activate() -> libc::c_int {
+    crate::lxpc::bootstrap_check()
+}
+
+/// Daemon-Hauptschleife. Ersetzt die normale main() in C-Daemons.
+/// Blockiert bis syscored die Verbindung schließt.
+///
+/// handler:       Wird für jede neue Client-Verbindung aufgerufen.
+/// event_handler: Wird für Steuerbefehle von syscored aufgerufen (optional, kann NULL sein).
+#[no_mangle]
+pub unsafe extern "C" fn lxpc_main(
+    handler: extern "C" fn(*mut lxpc_connection),
+    event_handler: Option<extern "C" fn(*mut lxpc_object)>,
+) {
+    crate::lxpc::run_main(handler, event_handler);
 }
